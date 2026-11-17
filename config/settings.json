@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "Agent",
+      "Skill",
+      "TodoWrite",
+      "WebSearch",
+      "WebFetch"
+    ],
+    "deny": [
+      "Bash(gh pr merge *)",
+      "Bash(gh pr ready *)",
+      "Bash(gh repo delete *)",
+      "Bash(gh repo edit *)",
+      "Bash(gh repo rename *)",
+      "Bash(gh repo archive *)",
+      "Bash(gh secret *)",
+      "Bash(gh variable *)",
+      "Bash(gh auth *)",
+      "Bash(gh ssh-key *)",
+      "Bash(gh gpg-key *)",
+      "Bash(gh release *)",
+      "Bash(gh workflow run *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git push --force-with-lease *)",
+      "Bash(git push --delete *)",
+      "Bash(git push --mirror *)",
+      "Bash(sudo *)",
+      "Bash(im ask *)",
+      "Bash(im show *)",
+      "Bash(im wait *)"
+    ]
+  }
+}

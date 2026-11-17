@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# factory-status <issue> <stage> [--type T] [--size S|M|L] [--note "text"] [--pr N]
+#
+# The one way to move an issue through the factory. In one call it:
+#   1. swaps the issue's factory:* label (and type:/size: labels when given),
+#   2. rewrites the issue's single "Factory status" comment (stage table + timeline),
+#   3. moves the issue's card on the GitHub Project board (when FACTORY_PROJECT is set).
+#
+# Stages: triage needs-info planning plan-review building reviewing pr-open epic done blocked
+set -uo pipefail
+
+usage() {
+  echo "usage: factory-status <issue> <stage> [--type bug|feature|chore|security|question] [--size S|M|L] [--note text] [--pr N]" >&2
+  exit 1
+}
+[ $# -ge 2 ] || usage
+n="$1"; stage="$2"; shift 2
+type=""; size=""; note=""; pr=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --type) type="${2:-}"; shift 2 ;;
+    --size) size="${2:-}"; shift 2 ;;
+    --note) note="${2:-}"; shift 2 ;;
+    --pr)   pr="${2:-}";   shift 2 ;;
+    *) usage ;;
+  esac
+done
+repo="${FACTORY_REPO:?FACTORY_REPO is not set}"
+[[ "$n" =~ ^[0-9]+$ ]] || usage
+
+STAGES="triage needs-info planning plan-review building reviewing pr-open epic done blocked"
+case " $STAGES " in *" $stage "*) ;; *) echo "factory-status: unknown stage '$stage' (use one of: $STAGES)" >&2; exit 1 ;; esac
+case "$type" in ""|bug|feature|chore|security|question) ;; *) echo "factory-status: bad --type '$type'" >&2; exit 1 ;; esac
+case "$size" in ""|S|M|L) ;; *) echo "factory-status: bad --size '$size' (S, M or L)" >&2; exit 1 ;; esac
+[ -z "$pr" ] || [[ "$pr" =~ ^[0-9]+$ ]] || { echo "factory-status: bad --pr '$pr'" >&2; exit 1; }
+
+stage_title() {
+  case "$1" in
+    triage) echo "Triage" ;; needs-info) echo "Needs info" ;; planning) echo "Planning" ;;
+    plan-review) echo "Plan review" ;; building) echo "Building" ;; reviewing) echo "Reviewing" ;;
+    pr-open) echo "PR open" ;; epic) echo "Epic in progress" ;; done) echo "Done" ;; blocked) echo "Blocked" ;;
+  esac
+}
+label_color() {
+  case "$1" in
+    factory:needs-info|factory:plan-review) echo FBCA04 ;;
+    factory:blocked) echo B60205 ;;
+    factory:done) echo 0E8A16 ;;
+    factory:pr-open) echo 1D76DB ;;
+    factory:epic) echo 5319E7 ;;
+    factory:*) echo C5DEF5 ;;
+    type:*) echo D4C5F9 ;;
+    size:*) echo BFDADC ;;
+    *) echo EDEDED ;;
+  esac
+}
+
+# ---- 1. labels ----
+existing="$(gh label list -R "$repo" --limit 300 --json name --jq '.[].name' 2>/dev/null)"
+ensure_label() {
+  grep -qxF -- "$1" <<<"$existing" && return 0
+  gh label create "$1" -R "$repo" --color "$(label_color "$1")" --force >/dev/null 2>&1 || true
+}
+current="$(gh issue view "$n" -R "$repo" --json labels --jq '.labels[].name')" || { echo "factory-status: cannot read issue #$n" >&2; exit 1; }
+add=("factory:$stage"); remove=()
+while IFS= read -r l; do
+  [ -n "$l" ] || continue
+  case "$l" in
+    factory:*) if [ "$l" != "factory:$stage" ]; then remove+=("$l"); fi ;;
+    type:*)    if [ -n "$type" ] && [ "$l" != "type:$type" ]; then remove+=("$l"); fi ;;
+    size:*)    if [ -n "$size" ] && [ "$l" != "size:$size" ]; then remove+=("$l"); fi ;;
+  esac
+done <<<"$current"
+[ -n "$type" ] && add+=("type:$type")
+[ -n "$size" ] && add+=("size:$size")
+[ -n "$type" ] || type="$(grep -m1 '^type:' <<<"$current" | cut -d: -f2)"
+[ -n "$size" ] || size="$(grep -m1 '^size:' <<<"$current" | cut -d: -f2)"
+for l in "${add[@]}"; do ensure_label "$l"; done
+args=()
+for l in "${add[@]}"; do args+=(--add-label "$l"); done
+for l in "${remove[@]}"; do args+=(--remove-label "$l"); done
+gh issue edit "$n" -R "$repo" "${args[@]}" >/dev/null || { echo "factory-status: could not update labels on #$n" >&2; exit 1; }
+
+# ---- 2. status comment ----
+now="$(date -u '+%Y-%m-%d %H:%M UTC')"
+found="$(gh api "repos/$repo/issues/$n/comments" --paginate \
+  --jq '.[] | select(.body | contains("<!-- factory:status -->")) | {id, body} | @json' 2>/dev/null | head -1)"
+cid=""; old=""
+if [ -n "$found" ]; then cid="$(jq -r .id <<<"$found")"; old="$(jq -r .body <<<"$found")"; fi
+timeline="$(grep -E '^- `' <<<"$old" || true)"
+[ -n "$pr" ] || pr="$(grep -oE '<!-- factory:pr=[0-9]+ -->' <<<"$old" | grep -oE '[0-9]+' | head -1)"
+line="- \`$now\` **$(stage_title "$stage")**"
+[ -n "$note" ] && line="$line · $(tr '\n' ' ' <<<"$note")"
+
+tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+{
+  echo "### 🏭 Factory status"
+  echo
+  echo "| Stage | Type | Size | Pull request | Updated |"
+  echo "|---|---|---|---|---|"
+  echo "| **$(stage_title "$stage")** | ${type:-·} | ${size:-·} | ${pr:+#$pr} | $now |"
+  echo
+  echo "**Timeline**"
+  echo
+  [ -n "$timeline" ] && echo "$timeline"
+  echo "$line"
+  echo
+  echo "<!-- factory:status -->"
+  [ -n "$pr" ] && echo "<!-- factory:pr=$pr -->"
+  echo "<!-- factory -->"
+} > "$tmp"
+if [ -n "$cid" ]; then
+  gh api -X PATCH "repos/$repo/issues/comments/$cid" -F "body=@$tmp" >/dev/null || echo "factory-status: warning: could not update status comment" >&2
+else
+  gh api "repos/$repo/issues/$n/comments" -F "body=@$tmp" >/dev/null || echo "factory-status: warning: could not create status comment" >&2
+fi
+
+# ---- 3. project board ----
+board_sync() {
+  local owner="${FACTORY_PROJECT%/*}" num="${FACTORY_PROJECT##*/}" cache pid fields item
+  cache="${XDG_CACHE_HOME:-$HOME/.cache}/factory/project-${owner}-${num}.json"
+  if [ ! -s "$cache" ]; then
+    mkdir -p "$(dirname "$cache")"
+    pid="$(gh project view "$num" --owner "$owner" --format json --jq .id)" || return 1
+    fields="$(gh project field-list "$num" --owner "$owner" --format json --limit 100)" || return 1
+    jq -n --arg pid "$pid" --argjson f "$fields" '{pid: $pid, fields: $f.fields}' > "$cache" || return 1
+  fi
+  pid="$(jq -r .pid "$cache")"
+  item="$(gh project item-add "$num" --owner "$owner" --url "https://github.com/$repo/issues/$n" --format json --jq .id)" || return 1
+  set_field() {   # field-name option-name
+    local fid oid
+    fid="$(jq -r --arg f "$1" '.fields[] | select(.name == $f) | .id' "$cache")"
+    oid="$(jq -r --arg f "$1" --arg o "$2" '.fields[] | select(.name == $f) | .options[]? | select(.name == $o) | .id' "$cache")"
+    [ -n "$fid" ] && [ -n "$oid" ] || return 0
+    gh project item-edit --id "$item" --project-id "$pid" --field-id "$fid" --single-select-option-id "$oid" >/dev/null
+  }
+  set_field Stage "$(stage_title "$stage")"
+  [ -n "$type" ] && set_field Type "$type"
+  [ -n "$size" ] && set_field Size "$size"
+  return 0
+}
+if [ -n "${FACTORY_PROJECT:-}" ]; then
+  board_sync || echo "factory-status: warning: board update failed (labels and comment are updated)" >&2
+fi
+
+echo "factory-status: #$n → $(stage_title "$stage")${type:+ · $type}${size:+ · $size}"

@@ -1,0 +1,3 @@
+factory.env
+*.log
+.DS_Store

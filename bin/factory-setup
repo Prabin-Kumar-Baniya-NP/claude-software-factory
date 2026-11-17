@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# factory-setup <owner/repo> [--board] [--protect]
+#
+# One-time setup of a repo for the factory:
+#   (always)   creates the factory labels (trigger label, factory:* stages, type:*, size:*)
+#   --board    creates a GitHub Project "Factory" with Stage/Type/Size fields, links the repo,
+#              and prints the FACTORY_PROJECT value to put in factory.env
+#              (reuses FACTORY_PROJECT if it is already set)
+#   --protect  protects the default branch: PRs required, no force-push, applies to admins too
+#              (the factory acts as your gh user, so admins must be included for this to bind)
+set -uo pipefail
+
+FACTORY_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+ENV_FILE="${FACTORY_ENV:-$FACTORY_ROOT/factory.env}"
+if [ -f "$ENV_FILE" ]; then set -a; # shellcheck disable=SC1090
+  . "$ENV_FILE"; set +a; fi
+: "${FACTORY_LABEL:=factory}"
+: "${FACTORY_PROJECT:=}"
+
+repo="${1:-}"; shift || true
+[[ "$repo" == */* ]] || { echo "usage: factory-setup <owner/repo> [--board] [--protect]" >&2; exit 1; }
+want_board=0; want_protect=0
+for a in "$@"; do case "$a" in --board) want_board=1 ;; --protect) want_protect=1 ;; *) echo "unknown option $a" >&2; exit 1 ;; esac; done
+
+say() { printf '• %s\n' "$*"; }
+
+# ---------- labels ----------
+label() { gh label create "$1" -R "$repo" --color "$2" --description "$3" --force >/dev/null && say "label $1"; }
+label "$FACTORY_LABEL"        0E8A16 "Hand this issue to the Claude Software Factory"
+label factory:triage          C5DEF5 "Factory: being triaged"
+label factory:needs-info      FBCA04 "Factory: waiting for answers from a human"
+label factory:planning        C5DEF5 "Factory: planning"
+label factory:plan-review     FBCA04 "Factory: plan waiting for human approval (reply 'approve')"
+label factory:building        C5DEF5 "Factory: builder at work"
+label factory:reviewing       C5DEF5 "Factory: independent review in progress"
+label factory:pr-open         1D76DB "Factory: draft PR waiting for human review"
+label factory:epic            5319E7 "Factory: epic in progress (children run one by one)"
+label factory:done            0E8A16 "Factory: finished"
+label factory:blocked         B60205 "Factory: stuck, needs a human decision"
+for t in bug feature chore security question; do label "type:$t" D4C5F9 "Factory type: $t"; done
+label size:S BFDADC "Factory size: small, one obvious change"
+label size:M BFDADC "Factory size: medium, one planned PR"
+label size:L BFDADC "Factory size: large, split into child issues"
+
+# ---------- board ----------
+if [ "$want_board" = 1 ]; then
+  owner="${repo%%/*}"
+  if [ -n "$FACTORY_PROJECT" ]; then
+    owner="${FACTORY_PROJECT%/*}"; num="${FACTORY_PROJECT##*/}"
+    say "using existing project $FACTORY_PROJECT"
+  else
+    num="$(gh project create --owner "$owner" --title "Factory" --format json --jq .number)" || { echo "could not create project (run: gh auth refresh -s project)" >&2; exit 1; }
+    say "created project $owner/$num"
+  fi
+  have="$(gh project field-list "$num" --owner "$owner" --format json --limit 100 --jq '.fields[].name')"
+  field() {
+    grep -qxF "$1" <<<"$have" && { say "field $1 exists"; return; }
+    gh project field-create "$num" --owner "$owner" --name "$1" --data-type SINGLE_SELECT --single-select-options "$2" >/dev/null && say "field $1"
+  }
+  field Stage "Triage,Needs info,Planning,Plan review,Building,Reviewing,PR open,Epic in progress,Done,Blocked"
+  field Type  "bug,feature,chore,security,question"
+  field Size  "S,M,L"
+  gh project link "$num" --owner "$owner" --repo "$repo" >/dev/null 2>&1 && say "linked $repo to the project"
+  rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/factory/project-${owner}-${num}.json"
+  url="$(gh project view "$num" --owner "$owner" --format json --jq .url)"
+  echo
+  echo "Board: $url"
+  echo "Put this in factory.env:   FACTORY_PROJECT=$owner/$num"
+  echo "In the board view, choose 'Group by: Stage' (or use Stage as the board column field) once in the web UI."
+fi
+
+# ---------- branch protection ----------
+if [ "$want_protect" = 1 ]; then
+  def="$(gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name)"
+  errf="$(mktemp)"
+  if gh api -X PUT "repos/$repo/branches/$def/protection" --input - >/dev/null 2>"$errf" <<'JSON'
+{
+  "required_status_checks": null,
+  "enforce_admins": true,
+  "required_pull_request_reviews": { "required_approving_review_count": 0 },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+JSON
+  then
+    say "protected $def: changes only through PRs, no force-push (admins included)"
+  else
+    echo "! could not protect $def: $(tr '\n' ' ' < "$errf")" >&2
+    echo "  (private repos on a free GitHub plan can't use branch protection; the factory's guard hook still refuses pushes to anything but its own branch)" >&2
+  fi
+  rm -f "$errf"
+fi
+
+echo
+echo "Done. Add the '$FACTORY_LABEL' label to an issue in $repo to hand it to the factory."

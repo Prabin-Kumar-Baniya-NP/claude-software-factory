@@ -1,0 +1,5 @@
+{
+  "name": "factory",
+  "version": "0.1.0",
+  "description": "Claude Software Factory: skills, subagents, guard hooks and GitHub helpers that let headless Claude Code turn labeled GitHub issues into reviewed draft PRs."
+}

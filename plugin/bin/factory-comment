@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# factory-comment <issue-or-pr-number>      (comment body on stdin)
+#
+# Posts a comment on an issue or PR in $FACTORY_REPO, marked as written by the factory
+# (a hidden <!-- factory --> marker), so the launcher can tell factory comments from
+# human replies. Prints the comment URL.
+set -euo pipefail
+
+n="${1:-}"
+[[ "$n" =~ ^[0-9]+$ ]] || { echo "usage: factory-comment <issue-or-pr-number>  (body on stdin)" >&2; exit 1; }
+repo="${FACTORY_REPO:?FACTORY_REPO is not set}"
+
+body="$(cat)"
+[ -n "${body//[[:space:]]/}" ] || { echo "factory-comment: empty body" >&2; exit 1; }
+
+tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+printf '%s\n\n<!-- factory -->\n' "$body" > "$tmp"
+gh api "repos/$repo/issues/$n/comments" -F "body=@$tmp" --jq .html_url

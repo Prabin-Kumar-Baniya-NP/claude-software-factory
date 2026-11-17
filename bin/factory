@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# factory — the launcher of the Claude Software Factory.
+#
+# It watches GitHub with `gh` (read-only), and when an issue needs work it prepares that
+# issue's git worktree and starts headless Claude Code (`claude -p`, Opus) there with a
+# one-line event. Claude, guided by the factory plugin, does all the work and all GitHub
+# writes itself. The launcher never writes to GitHub and never reads Claude's output.
+#
+# Usage:
+#   factory run                         poll forever (the normal mode)
+#   factory once                        poll every repo once, start what's needed, exit
+#   factory kick <owner/repo> <n> [EV]  start a run for issue n now (EV defaults to "RESUME <n>")
+#   factory status                      show running runs and recent launcher log
+#   factory logs <owner/repo> <n>       show what Claude said in the latest run for issue n
+#   factory cleanup                     remove worktrees of closed issues
+#   factory help
+
+set -uo pipefail
+
+FACTORY_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+ENV_FILE="${FACTORY_ENV:-$FACTORY_ROOT/factory.env}"
+if [ -f "$ENV_FILE" ]; then set -a; # shellcheck disable=SC1090
+  . "$ENV_FILE"; set +a; fi
+
+# ---------- configuration (env vars, see factory.env.example) ----------
+: "${FACTORY_REPOS:=}"
+: "${FACTORY_LABEL:=factory}"
+: "${FACTORY_POLL_SECONDS:=60}"
+: "${FACTORY_MAX_PARALLEL:=2}"
+: "${FACTORY_MODEL:=opus}"
+: "${FACTORY_EFFORT:=high}"
+: "${FACTORY_RUN_TIMEOUT:=90m}"
+: "${FACTORY_RUN_BUDGET_USD:=0}"          # 0 = no --max-budget-usd cap
+: "${FACTORY_MAX_ATTEMPTS:=2}"            # how often to re-try an event whose run made no progress
+: "${FACTORY_RETRY_AFTER:=600}"           # seconds to wait before such a retry
+: "${FACTORY_HOME:=$HOME/factory}"
+: "${FACTORY_BRANCH_PREFIX:=factory/}"
+: "${FACTORY_MENTION:=@factory}"
+: "${FACTORY_MAX_REVIEW_ROUNDS:=2}"
+: "${FACTORY_EPIC_NEEDS_APPROVAL:=true}"
+: "${FACTORY_PROJECT:=}"
+: "${FACTORY_ALLOW_WORKFLOWS:=0}"
+: "${FACTORY_NOTIFY:=}"                   # "im" = also send Interrupt Me notifications from the launcher
+export FACTORY_ROOT FACTORY_HOME FACTORY_LABEL FACTORY_MODEL FACTORY_EFFORT FACTORY_BRANCH_PREFIX \
+  FACTORY_MENTION FACTORY_MAX_REVIEW_ROUNDS FACTORY_EPIC_NEEDS_APPROVAL FACTORY_PROJECT \
+  FACTORY_ALLOW_WORKFLOWS FACTORY_NOTIFY
+
+STATE="$FACTORY_HOME/state"
+LOGS="$FACTORY_HOME/logs"
+mkdir -p "$STATE/running" "$STATE/seen" "$STATE/attempts" "$STATE/meta" "$LOGS" \
+  "$FACTORY_HOME/repos" "$FACTORY_HOME/worktrees"
+
+MARKER='<!-- factory'
+ACTIVE_STATES="triage planning building reviewing"
+WAITING_FOR_HUMAN="needs-info plan-review"
+
+# ---------- small helpers ----------
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGS/launcher.log" >&2; }
+die() { log "error: $*"; exit 1; }
+slug() { local s="${1//\//__}"; printf '%s' "${s// /_}"; }
+notify() {
+  [ "$FACTORY_NOTIFY" = "im" ] && command -v im >/dev/null && im notify "factory: $1" --body "$2" >/dev/null 2>&1
+  return 0
+}
+
+seen_file()  { printf '%s/seen/%s' "$STATE" "$(slug "$1")"; }
+is_seen()    { grep -qxF -- "$2" "$(seen_file "$1")" 2>/dev/null; }
+mark_seen()  { printf '%s\n' "$2" >> "$(seen_file "$1")"; }
+
+pid_file()   { printf '%s/running/%s__%s.pid' "$STATE" "$(slug "$1")" "$2"; }
+is_running() { local f; f="$(pid_file "$1" "$2")"; [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; }
+running_count() {
+  local c=0 f
+  for f in "$STATE"/running/*.pid; do
+    [ -e "$f" ] || continue
+    if kill -0 "$(cat "$f")" 2>/dev/null; then c=$((c + 1)); else rm -f "$f"; fi
+  done
+  printf '%s' "$c"
+}
+
+attempt_file() { printf '%s/attempts/%s__%s' "$STATE" "$(slug "$1")" "$(printf '%s' "$2" | tr ' /:' '___')"; }
+attempt_ok() {   # condition-style events may be retried a few times, with a pause in between
+  local f n=0 last=0; f="$(attempt_file "$1" "$2")"
+  [ -f "$f" ] && read -r n last < "$f"
+  [ "$n" -ge "$FACTORY_MAX_ATTEMPTS" ] && return 2
+  [ "$n" -gt 0 ] && [ $(( $(date +%s) - last )) -lt "$FACTORY_RETRY_AFTER" ] && return 1
+  return 0
+}
+record_attempt() {
+  local f n=0 last=0; f="$(attempt_file "$1" "$2")"
+  [ -f "$f" ] && read -r n last < "$f"
+  printf '%s %s\n' "$((n + 1))" "$(date +%s)" > "$f"
+}
+
+default_branch() {
+  local f; f="$STATE/meta/$(slug "$1").default_branch"
+  if [ ! -s "$f" ]; then
+    gh repo view "$1" --json defaultBranchRef --jq .defaultBranchRef.name > "$f" 2>/dev/null || { rm -f "$f"; return 1; }
+  fi
+  cat "$f"
+}
+
+# ---------- workspace: one clone per repo, one worktree per issue ----------
+clone_dir()    { printf '%s/repos/%s' "$FACTORY_HOME" "$1"; }
+worktree_dir() { printf '%s/worktrees/%s/issue-%s' "$FACTORY_HOME" "$(slug "$1")" "$2"; }
+
+prepare_worktree() {   # repo issue -> prints worktree path
+  local repo="$1" n="$2" clone wt br def
+  clone="$(clone_dir "$repo")"; wt="$(worktree_dir "$repo" "$n")"; br="${FACTORY_BRANCH_PREFIX}issue-$n"
+  def="$(default_branch "$repo")" || { log "cannot read default branch of $repo"; return 1; }
+  if [ ! -d "$clone/.git" ]; then
+    mkdir -p "$(dirname "$clone")"
+    gh repo clone "$repo" "$clone" -- --quiet >/dev/null 2>&1 || { log "clone failed: $repo"; return 1; }
+  fi
+  git -C "$clone" fetch --quiet --prune origin || { log "fetch failed: $repo"; return 1; }
+  if ! git -C "$clone" rev-parse --verify --quiet "origin/$def" >/dev/null; then
+    log "$repo has no commits on $def yet; push an initial commit first"; return 1
+  fi
+  if [ ! -d "$wt" ]; then
+    mkdir -p "$(dirname "$wt")"
+    git -C "$clone" worktree prune
+    if git -C "$clone" show-ref --verify --quiet "refs/heads/$br"; then
+      git -C "$clone" worktree add --quiet "$wt" "$br" || return 1
+    elif git -C "$clone" show-ref --verify --quiet "refs/remotes/origin/$br"; then
+      git -C "$clone" worktree add --quiet -b "$br" "$wt" "origin/$br" || return 1
+    else
+      git -C "$clone" worktree add --quiet --no-track -b "$br" "$wt" "origin/$def" || return 1
+    fi
+    log "worktree ready: $wt ($br)"
+  fi
+  printf '%s' "$wt"
+}
+
+# ---------- starting Claude ----------
+spawn() {   # repo issue event-text
+  local repo="$1" n="$2" ev="$3" wt def logdir stamp logf prompt
+  wt="$(prepare_worktree "$repo" "$n")" || return 1
+  def="$(default_branch "$repo")"
+  logdir="$LOGS/$(slug "$repo")/$n"; mkdir -p "$logdir"
+  stamp="$(date +%Y%m%d-%H%M%S)"; logf="$logdir/$stamp.jsonl"
+  prompt="factory event: $ev
+Repository: $repo
+Issue: #$n
+Worktree: $wt (branch ${FACTORY_BRANCH_PREFIX}issue-$n, base $def)
+
+Load the factory:router skill and follow it."
+
+  local -a args=(
+    -p "$prompt"
+    --model "$FACTORY_MODEL" --effort "$FACTORY_EFFORT"
+    --plugin-dir "$FACTORY_ROOT/plugin"
+    --settings "$FACTORY_ROOT/config/settings.json"
+    --setting-sources project,local
+    --strict-mcp-config
+    --append-system-prompt "$(cat "$FACTORY_ROOT/config/system-prompt.md")"
+    --permission-mode dontAsk --permission-prompts none
+    --output-format stream-json --verbose
+  )
+  if [ "$FACTORY_RUN_BUDGET_USD" != "0" ]; then args+=(--max-budget-usd "$FACTORY_RUN_BUDGET_USD"); fi
+
+  (
+    cd "$wt" || exit 1
+    export FACTORY_REPO="$repo" FACTORY_ISSUE="$n" FACTORY_EVENT="$ev" \
+      FACTORY_BRANCH="${FACTORY_BRANCH_PREFIX}issue-$n" FACTORY_DEFAULT_BRANCH="$def" \
+      FACTORY_WORKTREE="$wt" PATH="$FACTORY_ROOT/plugin/bin:$PATH"
+    timeout --kill-after=60 "$FACTORY_RUN_TIMEOUT" claude "${args[@]}" < /dev/null > "$logf" 2>&1
+    rc=$?
+    printf '%s exit=%s event=%s\n' "$(date '+%F %T')" "$rc" "$ev" >> "$logdir/runs.txt"
+    rm -f "$(pid_file "$repo" "$n")"
+    exit "$rc"
+  ) &
+  printf '%s' "$!" > "$(pid_file "$repo" "$n")"
+  log "started: $repo #$n [$ev] pid $! log $logf"
+}
+
+# try_fire repo issue mode key event-text      (returns 0 only if a run was started)
+#   mode once: fire only the first time this key is seen (comments, merges, CI runs)
+#   mode cond: fire while the condition holds, retrying a few times (new issue, reply, resume)
+try_fire() {
+  local repo="$1" n="$2" mode="$3" key="$4" ev="$5" rc
+  is_running "$repo" "$n" && return 1
+  if [ "$mode" = once ]; then
+    is_seen "$repo" "$key" && return 1
+  else
+    attempt_ok "$repo" "$key"; rc=$?
+    if [ "$rc" -eq 2 ]; then
+      if ! is_seen "$repo" "GAVEUP $key"; then
+        mark_seen "$repo" "GAVEUP $key"
+        log "giving up on $repo [$key] after $FACTORY_MAX_ATTEMPTS runs; needs a person"
+        notify "stuck on $repo #$n" "Event \`$key\` ran $FACTORY_MAX_ATTEMPTS times without progress. Check the issue and \`factory logs $repo $n\`."
+      fi
+      return 1
+    fi
+    [ "$rc" -ne 0 ] && return 1
+  fi
+  if [ "$(running_count)" -ge "$FACTORY_MAX_PARALLEL" ]; then
+    log "busy ($FACTORY_MAX_PARALLEL runs): deferring $repo [$key]"; return 1
+  fi
+  spawn "$repo" "$n" "$ev" < /dev/null || { log "could not start $repo [$key]"; return 1; }
+  if [ "$mode" = once ]; then mark_seen "$repo" "$key"; else record_attempt "$repo" "$key"; fi
+  return 0
+}
+
+# ---------- polling (read-only gh calls) ----------
+in_list() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+poll_repo() {
+  local repo="$1" first=0 n labels state has_trigger lbl
+  [ -f "$(seen_file "$repo")" ] || { first=1; : > "$(seen_file "$repo")"; log "first poll of $repo: recording existing PR activity as already seen"; }
+
+  # 1) issues: new work, human replies, unfinished work
+  local issues
+  issues="$(gh issue list -R "$repo" --state open --limit 300 --json number,labels \
+    --jq '.[] | [.number, ([.labels[].name] | join(","))] | @tsv')" || { log "gh issue list failed for $repo"; return 1; }
+  while IFS=$'\t' read -r n labels; do
+    [ -n "$n" ] || continue
+    state=""; has_trigger=0
+    IFS=',' read -ra lbls <<< "$labels"
+    for lbl in "${lbls[@]}"; do
+      [ "$lbl" = "$FACTORY_LABEL" ] && has_trigger=1
+      case "$lbl" in factory:*) state="${lbl#factory:}" ;; esac
+    done
+    if [ -z "$state" ]; then
+      [ "$has_trigger" = 1 ] && try_fire "$repo" "$n" cond "NEW_ISSUE $n" "NEW_ISSUE $n"
+    elif in_list "$state" "$WAITING_FOR_HUMAN"; then
+      local last
+      last="$(gh issue view "$n" -R "$repo" --json comments --jq \
+        '.comments[-1] // empty | select(.authorAssociation=="OWNER" or .authorAssociation=="MEMBER" or .authorAssociation=="COLLABORATOR") | select(.body | contains("<!-- factory") | not) | .id' < /dev/null)"
+      [ -n "$last" ] && try_fire "$repo" "$n" cond "REPLY $n $last" "REPLY $n"
+    elif in_list "$state" "$ACTIVE_STATES"; then
+      try_fire "$repo" "$n" cond "RESUME $n $state" "RESUME $n"
+    fi
+  done <<< "$issues"
+
+  # 2) the factory's open PRs: failed CI and human feedback
+  local prs p head sha fails issue ids id fresh
+  prs="$(gh pr list -R "$repo" --state open --limit 100 --json number,headRefName,headRefOid,statusCheckRollup \
+    --jq ".[] | select(.headRefName | startswith(\"${FACTORY_BRANCH_PREFIX}issue-\"))
+               | [.number, .headRefName, .headRefOid,
+                  ([.statusCheckRollup[]? | (.conclusion // .state // \"\")] | map(select(. == \"FAILURE\" or . == \"ERROR\" or . == \"TIMED_OUT\")) | length)]
+               | @tsv")" || prs=""
+  while IFS=$'\t' read -r p head sha fails; do
+    [ -n "$p" ] || continue
+    issue="${head#"${FACTORY_BRANCH_PREFIX}"issue-}"
+    if [ "${fails:-0}" -gt 0 ]; then
+      try_fire "$repo" "$issue" once "CI_FAILED $p ${sha:0:7}" "CI_FAILED pr $p"
+    fi
+    ids="$( { gh pr view "$p" -R "$repo" --json comments,reviews --jq \
+                '(.comments[], (.reviews[] | select(.body != ""))) | select(.body | contains("<!-- factory") | not) | .id' ;
+              gh api "repos/$repo/pulls/$p/comments" --paginate --jq \
+                '.[] | select(.body | contains("<!-- factory") | not) | .id' ; } < /dev/null 2>/dev/null)"
+    fresh=""
+    for id in $ids; do is_seen "$repo" "FEEDBACK $p $id" || fresh="$fresh $id"; done
+    if [ -n "$fresh" ]; then
+      if [ "$first" = 1 ]; then
+        for id in $fresh; do mark_seen "$repo" "FEEDBACK $p $id"; done
+      elif try_fire "$repo" "$issue" once "PR_FEEDBACK $p$(printf '%s' "$fresh" | tr ' ' '_')" "PR_FEEDBACK pr $p"; then
+        for id in $fresh; do mark_seen "$repo" "FEEDBACK $p $id"; done
+      fi
+    fi
+  done <<< "$prs"
+
+  # 3) merged factory PRs (finish the issue, advance epics)
+  local merged
+  merged="$(gh pr list -R "$repo" --state merged --limit 30 --json number,headRefName \
+    --jq ".[] | select(.headRefName | startswith(\"${FACTORY_BRANCH_PREFIX}issue-\")) | [.number, .headRefName] | @tsv")" || merged=""
+  while IFS=$'\t' read -r p head; do
+    [ -n "$p" ] || continue
+    issue="${head#"${FACTORY_BRANCH_PREFIX}"issue-}"
+    if [ "$first" = 1 ]; then mark_seen "$repo" "PR_MERGED $p"; continue; fi
+    try_fire "$repo" "$issue" once "PR_MERGED $p" "PR_MERGED pr $p"
+  done <<< "$merged"
+
+  # 4) @factory mentions on issues/PRs the factory isn't already handling
+  local sincef since now cid inum
+  sincef="$STATE/meta/$(slug "$repo").since"; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  since="$(cat "$sincef" 2>/dev/null || printf '%s' "$now")"
+  while IFS=$'\t' read -r cid inum; do
+    [ -n "$cid" ] || continue
+    gh issue view "$inum" -R "$repo" --json labels --jq '[.labels[].name] | map(select(startswith("factory:"))) | length' < /dev/null 2>/dev/null | grep -qx 0 || continue
+    try_fire "$repo" "$inum" once "MENTION $cid" "MENTION $inum comment $cid"
+  done < <(gh api "repos/$repo/issues/comments?since=$since&per_page=100" --jq \
+    ".[] | select(.body | ascii_downcase | contains(\"$(printf '%s' "$FACTORY_MENTION" | tr '[:upper:]' '[:lower:]')\"))
+         | select(.body | contains(\"$MARKER\") | not)
+         | select(.author_association == \"OWNER\" or .author_association == \"MEMBER\" or .author_association == \"COLLABORATOR\")
+         | [.id, (.issue_url | split(\"/\") | last)] | @tsv" 2>/dev/null)
+  printf '%s' "$now" > "$sincef"
+}
+
+poll_all() {
+  local r
+  IFS=',' read -ra repos <<< "$FACTORY_REPOS"
+  for r in "${repos[@]}"; do
+    r="$(printf '%s' "$r" | tr -d '[:space:]')"; [ -n "$r" ] || continue
+    poll_repo "$r" || log "poll of $r failed"
+  done
+}
+
+# ---------- commands ----------
+preflight() {
+  [ -n "$FACTORY_REPOS" ] || die "FACTORY_REPOS is empty (set it in factory.env, e.g. owner/repo)"
+  local t; for t in gh git jq claude timeout flock; do command -v "$t" >/dev/null || die "missing tool: $t"; done
+  gh auth status >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
+}
+
+cmd_run() {
+  preflight
+  exec 9> "$FACTORY_HOME/launcher.lock"
+  flock -n 9 || die "another 'factory run' is already running"
+  log "factory launcher started: repos=$FACTORY_REPOS label=$FACTORY_LABEL model=$FACTORY_MODEL parallel=$FACTORY_MAX_PARALLEL every=${FACTORY_POLL_SECONDS}s"
+  trap 'log "launcher stopped"; exit 0' INT TERM
+  local i=0
+  while true; do
+    poll_all
+    i=$((i + 1)); [ $((i % 30)) -eq 0 ] && cmd_cleanup quiet
+    sleep "$FACTORY_POLL_SECONDS"
+  done
+}
+
+cmd_once() { preflight; poll_all; }
+
+cmd_kick() {
+  [ $# -ge 2 ] || die "usage: factory kick <owner/repo> <issue> [EVENT]"
+  local repo="$1" n="$2" ev="${3:-RESUME $2}"
+  is_running "$repo" "$n" && die "a run for $repo #$n is already active"
+  spawn "$repo" "$n" "$ev"
+}
+
+cmd_status() {
+  local f base any=0
+  echo "Running:"
+  for f in "$STATE"/running/*.pid; do
+    [ -e "$f" ] || continue
+    if kill -0 "$(cat "$f")" 2>/dev/null; then
+      base="$(basename "$f" .pid)"; any=1
+      printf '  %s  (pid %s)\n' "${base//__/\/}" "$(cat "$f")"
+    fi
+  done
+  [ "$any" = 1 ] || echo "  (none)"
+  echo; echo "Recent launcher log:"; tail -n 15 "$LOGS/launcher.log" 2>/dev/null | sed 's/^/  /'
+}
+
+cmd_logs() {
+  [ $# -ge 2 ] || die "usage: factory logs <owner/repo> <issue>"
+  local dir latest; dir="$LOGS/$(slug "$1")/$2"
+  latest="$(ls -1t "$dir"/*.jsonl 2>/dev/null | head -1)"
+  [ -n "$latest" ] || die "no runs logged for $1 #$2"
+  echo "== $latest"
+  jq -r '
+    if .type == "assistant" then
+      (.message.content[]? |
+        if .type == "text" then "💬 " + .text
+        elif .type == "tool_use" then "🔧 " + .name + " " + ((.input.command // .input.description // .input.file_path // .input.skill // .input.subagent_type // "") | tostring | .[0:200])
+        else empty end)
+    elif .type == "result" then "✅ result: " + (.subtype // "") + "  cost=$" + ((.total_cost_usd // 0) | tostring) + "  turns=" + ((.num_turns // 0) | tostring)
+    else empty end' "$latest" 2>/dev/null || tail -n 50 "$latest"
+  [ -f "$dir/runs.txt" ] && { echo; echo "== runs"; tail -n 10 "$dir/runs.txt"; }
+}
+
+cmd_cleanup() {   # remove worktrees whose issue is closed and that have nothing unpushed
+  local quiet="${1:-}" d repo_slug repo n clone
+  for d in "$FACTORY_HOME"/worktrees/*/issue-*; do
+    [ -d "$d" ] || continue
+    repo_slug="$(basename "$(dirname "$d")")"; repo="${repo_slug//__/\/}"; n="${d##*issue-}"
+    is_running "$repo" "$n" && continue
+    [ "$(gh issue view "$n" -R "$repo" --json state --jq .state 2>/dev/null)" = "CLOSED" ] || continue
+    if [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]; then [ -z "$quiet" ] && log "keeping $d: uncommitted changes"; continue; fi
+    if [ -n "$(git -C "$d" log --oneline '@{u}..' 2>/dev/null)" ]; then [ -z "$quiet" ] && log "keeping $d: unpushed commits"; continue; fi
+    clone="$(clone_dir "$repo")"
+    git -C "$clone" worktree remove "$d" >/dev/null 2>&1 && log "removed worktree $d"
+  done
+}
+
+case "${1:-help}" in
+  run) shift; cmd_run "$@" ;;
+  once) shift; cmd_once "$@" ;;
+  kick) shift; cmd_kick "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  cleanup) shift; cmd_cleanup "$@" ;;
+  help|-h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $1 (try: factory help)" ;;
+esac
