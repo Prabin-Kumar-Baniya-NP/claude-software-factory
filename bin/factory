@@ -245,10 +245,16 @@ poll_repo() {
     if [ "${fails:-0}" -gt 0 ]; then
       try_fire "$repo" "$issue" once "CI_FAILED $p ${sha:0:7}" "CI_FAILED pr $p"
     fi
+    # only humans with write access count as feedback (skips bots such as secret scanners or CI apps)
     ids="$( { gh pr view "$p" -R "$repo" --json comments,reviews --jq \
-                '(.comments[], (.reviews[] | select(.body != ""))) | select(.body | contains("<!-- factory") | not) | .id' ;
+                '(.comments[], (.reviews[] | select(.body != "")))
+                 | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+                 | select(.author.login | endswith("[bot]") | not)
+                 | select(.body | contains("<!-- factory") | not) | .id' ;
               gh api "repos/$repo/pulls/$p/comments" --paginate --jq \
-                '.[] | select(.body | contains("<!-- factory") | not) | .id' ; } < /dev/null 2>/dev/null)"
+                '.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+                     | select(.user.type != "Bot")
+                     | select(.body | contains("<!-- factory") | not) | .id' ; } < /dev/null 2>/dev/null)"
     fresh=""
     for id in $ids; do is_seen "$repo" "FEEDBACK $p $id" || fresh="$fresh $id"; done
     if [ -n "$fresh" ]; then
