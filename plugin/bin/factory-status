@@ -135,7 +135,7 @@ board_sync() {
     gh project item-edit --id "$item" --project-id "$pid" --field-id "$fid" --single-select-option-id "$oid" >/dev/null
   }
   set_field Stage "$(stage_title "$stage")"
-  [ -n "$type" ] && set_field Type "$type"
+  [ -n "$type" ] && set_field "Work type" "$type"
   [ -n "$size" ] && set_field Size "$size"
   return 0
 }

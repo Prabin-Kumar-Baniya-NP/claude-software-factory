@@ -58,7 +58,7 @@ if [ "$want_board" = 1 ]; then
     gh project field-create "$num" --owner "$owner" --name "$1" --data-type SINGLE_SELECT --single-select-options "$2" >/dev/null && say "field $1"
   }
   field Stage "Triage,Needs info,Planning,Plan review,Building,Reviewing,PR open,Epic in progress,Done,Blocked"
-  field Type  "bug,feature,chore,security,question"
+  field "Work type" "bug,feature,chore,security,question"   # "Type" is reserved by GitHub
   field Size  "S,M,L"
   gh project link "$num" --owner "$owner" --repo "$repo" >/dev/null 2>&1 && say "linked $repo to the project"
   rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/factory/project-${owner}-${num}.json"
